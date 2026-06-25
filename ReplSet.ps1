@@ -199,22 +199,76 @@ function Stop-MongodByPort {
 	}
 }
 
+function Test-ConfigHasReplicaSetName {
+	param(
+		[Parameter(Mandatory = $true)][string]$ConfigPath,
+		[Parameter(Mandatory = $true)][string]$ReplicaSetName
+	)
+
+	if (-not (Test-Path $ConfigPath)) {
+		return $false
+	}
+
+	$content = Get-Content -Path $ConfigPath -Raw -ErrorAction SilentlyContinue
+	if ([string]::IsNullOrWhiteSpace($content)) {
+		return $false
+	}
+
+	$escapedSetName = [Regex]::Escape($ReplicaSetName)
+	$replSetPattern = '(?im)^\s*replSetName\s*:\s*["'']?' + $escapedSetName + '["'']?\s*$'
+	$hasReplSetName = $content -match $replSetPattern
+	return $hasReplSetName
+}
+
 function Install-ServiceIfNeeded {
 	param(
 		[Parameter(Mandatory = $true)][string]$MongodPath,
 		[Parameter(Mandatory = $true)][string]$ConfigPath,
 		[Parameter(Mandatory = $true)][string]$ServiceName,
-		[Parameter(Mandatory = $true)][string]$ServiceDisplayName
+		[Parameter(Mandatory = $true)][string]$ServiceDisplayName,
+		[Parameter(Mandatory = $true)][string]$ReplicaSetName
 	)
 
 	$existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+	$configHasReplicaSet = Test-ConfigHasReplicaSetName -ConfigPath $ConfigPath -ReplicaSetName $ReplicaSetName
+
 	if ($existing) {
-		Write-Log "Service $ServiceName already exists. Skipping install step." "WARN"
-		return
+		$needsReinstall = $false
+		$svcDetails = Get-CimInstance Win32_Service -Filter "Name = '$ServiceName'" -ErrorAction SilentlyContinue
+		if (-not $svcDetails) {
+			$needsReinstall = $true
+			Write-Log "Cannot read service details for $ServiceName. Reinstalling service to ensure replica set startup options." "WARN"
+		}
+		else {
+			$pathName = $svcDetails.PathName
+			$serviceReplSetPattern = '(?i)--replSet\s+["'']?' + [Regex]::Escape($ReplicaSetName) + '(["'']|\s|$)'
+			$serviceHasReplSetArg = $pathName -match $serviceReplSetPattern
+			if ((-not $serviceHasReplSetArg) -and (-not $configHasReplicaSet)) {
+				$needsReinstall = $true
+				Write-Log "Service $ServiceName exists but neither service command nor config has replica set name '$ReplicaSetName'. Reinstalling." "WARN"
+			}
+		}
+
+		if (-not $needsReinstall) {
+			Write-Log "Service $ServiceName already exists and has replica set startup settings. Skipping install step." "INFO"
+			return
+		}
+
+		if ($existing.Status -eq "Running") {
+			Write-Log "Stopping service $ServiceName before reinstall." "INFO"
+			Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+			(Get-Service -Name $ServiceName).WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+		}
+
+		Write-Log "Removing legacy service $ServiceName." "INFO"
+		& $MongodPath --serviceName $ServiceName --remove
+		if ($LASTEXITCODE -ne 0) {
+			throw "Failed to remove legacy service $ServiceName."
+		}
 	}
 
 	Write-Log "Installing service $ServiceName ($ServiceDisplayName)" "INFO"
-	& $MongodPath --config $ConfigPath --serviceName $ServiceName --serviceDisplayName $ServiceDisplayName --install
+	& $MongodPath --config $ConfigPath --replSet $ReplicaSetName --serviceName $ServiceName --serviceDisplayName $ServiceDisplayName --install
 	if ($LASTEXITCODE -ne 0) {
 		throw "Failed to install service $ServiceName."
 	}
@@ -507,9 +561,9 @@ foreach ($port in $nodePorts) {
 Start-Sleep -Seconds 3
 
 Write-Log "Step 8 - Install services for all 3 nodes" "INFO"
-Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$PrimaryPort] -ServiceName "mongo-primary" -ServiceDisplayName "MongoDB Primary"
-Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$SecondaryPort] -ServiceName "mongo-secondary" -ServiceDisplayName "MongoDB Secondary"
-Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$ArbiterPort] -ServiceName "mongo-arbiter" -ServiceDisplayName "MongoDB Arbiter"
+Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$PrimaryPort] -ServiceName "mongo-primary" -ServiceDisplayName "MongoDB Primary" -ReplicaSetName $ReplicaSetName
+Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$SecondaryPort] -ServiceName "mongo-secondary" -ServiceDisplayName "MongoDB Secondary" -ReplicaSetName $ReplicaSetName
+Install-ServiceIfNeeded -MongodPath $mongodPath -ConfigPath $nodeConfigs[$ArbiterPort] -ServiceName "mongo-arbiter" -ServiceDisplayName "MongoDB Arbiter" -ReplicaSetName $ReplicaSetName
 
 Write-Log "Step 9 - Start all 3 services" "INFO"
 Start-ServiceSafe -ServiceName "mongo-primary"
