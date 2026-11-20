@@ -436,7 +436,8 @@ foreach ($port in $nodePorts) {
 	else {
 		Write-Log "Starting node $NormalizedPrimaryHost`:$port with config $cfg" "INFO"
 	}
-	Start-Process -FilePath $mongodPath -ArgumentList @("--config", $cfg, "--replSet", $ReplicaSetName) -WindowStyle Hidden | Out-Null
+	# Start-Process joins arguments into a command line, so paths with spaces need explicit quotes.
+	Start-Process -FilePath $mongodPath -ArgumentList @("--config", "`"$cfg`"", "--replSet", $ReplicaSetName) -WindowStyle Hidden | Out-Null
 
 	$isReadyAfterStart = $false
 	if ($hasMongoShell) {
